@@ -518,44 +518,83 @@ function getDoubanCoverPlaceholder(title = '暂无封面') {
     return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
 }
 
-// 豆瓣封面备用加载：原图失败时，改走带鉴权参数的 LibreTV proxy
+// 产生带鉴权参数的 LibreTV proxy 图片网址。
+// 新版 /proxy/ 需要 auth 和 t，否则 Cloudflare 会回 401 Unauthorized。
+async function getAuthenticatedDoubanProxyUrl(originalUrl) {
+    if (!originalUrl || originalUrl === 'undefined' || originalUrl === 'null') {
+        return '';
+    }
+
+    let proxyUrl = PROXY_URL + encodeURIComponent(originalUrl);
+
+    if (window.ProxyAuth && typeof window.ProxyAuth.addAuthToProxyUrl === 'function') {
+        proxyUrl = await window.ProxyAuth.addAuthToProxyUrl(proxyUrl);
+    }
+
+    return proxyUrl;
+}
+
+// 豆瓣封面加载：预设直接走「带鉴权参数」的 /proxy/，不先直连豆瓣图片。
+// 这样可以减少浏览器直接请求 img*.doubanio.com 时出现的 418。
 async function setDoubanProxyCover(img, encodedUrl) {
+    const placeholder = getDoubanCoverPlaceholder(img.alt);
+
     try {
         const originalUrl = decodeURIComponent(encodedUrl || '');
 
         if (!originalUrl || originalUrl === 'undefined' || originalUrl === 'null') {
             img.onerror = null;
-            img.src = getDoubanCoverPlaceholder(img.alt);
+            img.src = placeholder;
+            img.classList.remove('object-cover');
             img.classList.add('object-contain');
             return;
         }
 
-        let proxyUrl = PROXY_URL + encodeURIComponent(originalUrl);
+        const proxyUrl = await getAuthenticatedDoubanProxyUrl(originalUrl);
 
-        // 新版 LibreTV 的 /proxy/ 需要 auth 和 t 参数，否则 Cloudflare 会回 401
-        if (window.ProxyAuth && typeof window.ProxyAuth.addAuthToProxyUrl === 'function') {
-            proxyUrl = await window.ProxyAuth.addAuthToProxyUrl(proxyUrl);
+        if (!proxyUrl) {
+            throw new Error('无法产生豆瓣封面代理网址');
         }
 
-        // 如果代理图片也失败，就显示占位图，避免无限破图
+        // 代理成功时维持海报填满卡片；代理失败时显示占位图，避免无限破图。
+        img.onload = function() {
+            this.classList.remove('object-contain');
+            this.classList.add('object-cover');
+        };
+
         img.onerror = function() {
             this.onerror = null;
+            this.onload = null;
             this.src = getDoubanCoverPlaceholder(this.alt);
+            this.classList.remove('object-cover');
             this.classList.add('object-contain');
         };
 
-        img.classList.add('object-contain');
         img.src = proxyUrl;
     } catch (e) {
         console.error('豆瓣封面代理加载失败：', e);
         img.onerror = null;
-        img.src = getDoubanCoverPlaceholder(img.alt);
+        img.onload = null;
+        img.src = placeholder;
+        img.classList.remove('object-cover');
         img.classList.add('object-contain');
     }
 }
 
-// 让 inline onerror 可以稳定调用
+// 批量套用豆瓣封面 proxy。
+// 因为 proxy 鉴权是异步的，所以图片先放占位图，再由这里改成 authenticated proxy 图片网址。
+function applyDoubanProxyCovers(root = document) {
+    const images = root.querySelectorAll('img[data-douban-cover]');
+    images.forEach(img => {
+        const encodedUrl = img.getAttribute('data-douban-cover') || '';
+        setDoubanProxyCover(img, encodedUrl);
+    });
+}
+
+// 让 inline 事件和其他脚本可以稳定调用
+window.getDoubanCoverPlaceholder = getDoubanCoverPlaceholder;
 window.setDoubanProxyCover = setDoubanProxyCover;
+window.applyDoubanProxyCovers = applyDoubanProxyCovers;
 
 // 抽取渲染豆瓣卡片的逻辑到单独函数
 function renderDoubanCards(data, container) {
@@ -587,19 +626,19 @@ function renderDoubanCards(data, container) {
                 .replace(/>/g, '&gt;');
             
             // 处理图片URL
-            // 1. 先直接使用豆瓣图片URL
+            // 不再先直连豆瓣图片，避免浏览器直接请求 img*.doubanio.com 出现 418。
+            // 先放占位图，卡片渲染完后再由 applyDoubanProxyCovers() 改成带鉴权参数的 /proxy/ 图片。
             const originalCoverUrl = item.cover || '';
-
-            // 2. 原图失败时，交给 setDoubanProxyCover() 改走「带鉴权参数」的 /proxy/
-            //    不要直接写 PROXY_URL + encodeURIComponent(...)，否则新版 proxy 会因为缺少 auth/t 回 401
             const encodedCoverUrl = encodeURIComponent(originalCoverUrl);
+            const placeholderCoverUrl = getDoubanCoverPlaceholder(safeTitle);
 
             // 为不同设备优化卡片布局
             card.innerHTML = `
                 <div class="relative w-full aspect-[2/3] overflow-hidden cursor-pointer" onclick="fillAndSearchWithDouban('${safeTitle}')">
-                    <img src="${originalCoverUrl}" alt="${safeTitle}" 
-                        class="w-full h-full object-cover transition-transform duration-500 hover:scale-110"
-                        onerror="this.onerror=null; setDoubanProxyCover(this, '${encodedCoverUrl}');"
+                    <img src="${placeholderCoverUrl}" alt="${safeTitle}" 
+                        data-douban-cover="${encodedCoverUrl}"
+                        class="w-full h-full object-contain transition-transform duration-500 hover:scale-110"
+                        onerror="this.onerror=null; this.src=getDoubanCoverPlaceholder(this.alt); this.classList.remove('object-cover'); this.classList.add('object-contain');"
                         loading="lazy" referrerpolicy="no-referrer">
                     <div class="absolute inset-0 bg-gradient-to-t from-black to-transparent opacity-60"></div>
                     <div class="absolute bottom-2 left-2 bg-black/70 text-white text-xs px-2 py-1 rounded-sm">
@@ -627,6 +666,11 @@ function renderDoubanCards(data, container) {
     // 清空并添加所有新元素
     container.innerHTML = "";
     container.appendChild(fragment);
+
+    // 预设直接改走 authenticated proxy，避免先直连豆瓣图片。
+    if (typeof window.applyDoubanProxyCovers === 'function') {
+        window.applyDoubanProxyCovers(container);
+    }
 }
 
 // 重置到首页
