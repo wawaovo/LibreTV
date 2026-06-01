@@ -500,7 +500,7 @@ async function fetchDoubanData(url) {
 }
 
 
-// 生成豆瓣封面占位图，避免代理或图片源失败时显示破图
+// 生成豆瓣封面占位图，避免所有备用来源失败时显示破图
 function getDoubanCoverPlaceholder(title = '暂无封面') {
     const safeTitle = String(title || '暂无封面')
         .replace(/[<>&"']/g, '')
@@ -516,6 +516,35 @@ function getDoubanCoverPlaceholder(title = '暂无封面') {
     `;
 
     return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+}
+
+// HTML 属性安全处理
+function escapeDoubanAttr(value = '') {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// inline onclick / onerror 使用的单引号字串安全处理
+function escapeDoubanJsString(value = '') {
+    return String(value)
+        .replace(/\\/g, '\\\\')
+        .replace(/'/g, "\\'")
+        .replace(/\n/g, '\\n')
+        .replace(/\r/g, '\\r')
+        .replace(/</g, '\\x3C')
+        .replace(/>/g, '\\x3E');
+}
+
+// 第三方图片代理，常用于绕过部分图片站外连限制。
+// 若此来源失败，会继续尝试 LibreTV 自己的 authenticated /proxy/。
+function getDoubanExternalImageProxyUrl(originalUrl) {
+    if (!originalUrl) return '';
+    const noProtocolUrl = String(originalUrl).replace(/^https?:\/\//i, '');
+    return `https://images.weserv.nl/?url=${encodeURIComponent(noProtocolUrl)}`;
 }
 
 // 产生带鉴权参数的 LibreTV proxy 图片网址。
@@ -534,67 +563,68 @@ async function getAuthenticatedDoubanProxyUrl(originalUrl) {
     return proxyUrl;
 }
 
-// 豆瓣封面加载：预设直接走「带鉴权参数」的 /proxy/，不先直连豆瓣图片。
-// 这样可以减少浏览器直接请求 img*.doubanio.com 时出现的 418。
-async function setDoubanProxyCover(img, encodedUrl) {
-    const placeholder = getDoubanCoverPlaceholder(img.alt);
+// 豆瓣封面错误处理顺序：
+// 1. 原始豆瓣图片失败后，先试第三方图片代理。
+// 2. 第三方图片代理失败后，再试带 auth/t 的 LibreTV /proxy/。
+// 3. 仍失败才显示「暂无封面」。
+async function handleDoubanCoverError(img) {
+    const encodedUrl = img.getAttribute('data-douban-cover') || '';
+    const stage = Number(img.getAttribute('data-douban-cover-stage') || '0');
+    const originalUrl = decodeURIComponent(encodedUrl || '');
 
-    try {
-        const originalUrl = decodeURIComponent(encodedUrl || '');
-
-        if (!originalUrl || originalUrl === 'undefined' || originalUrl === 'null') {
-            img.onerror = null;
-            img.src = placeholder;
-            img.classList.remove('object-cover');
-            img.classList.add('object-contain');
-            return;
-        }
-
-        const proxyUrl = await getAuthenticatedDoubanProxyUrl(originalUrl);
-
-        if (!proxyUrl) {
-            throw new Error('无法产生豆瓣封面代理网址');
-        }
-
-        // 代理成功时维持海报填满卡片；代理失败时显示占位图，避免无限破图。
-        img.onload = function() {
-            this.classList.remove('object-contain');
-            this.classList.add('object-cover');
-        };
-
-        img.onerror = function() {
-            this.onerror = null;
-            this.onload = null;
-            this.src = getDoubanCoverPlaceholder(this.alt);
-            this.classList.remove('object-cover');
-            this.classList.add('object-contain');
-        };
-
-        img.src = proxyUrl;
-    } catch (e) {
-        console.error('豆瓣封面代理加载失败：', e);
+    const showPlaceholder = () => {
         img.onerror = null;
         img.onload = null;
-        img.src = placeholder;
+        img.src = getDoubanCoverPlaceholder(img.alt);
         img.classList.remove('object-cover');
         img.classList.add('object-contain');
+    };
+
+    if (!originalUrl || originalUrl === 'undefined' || originalUrl === 'null') {
+        showPlaceholder();
+        return;
     }
+
+    // 第一层备援：第三方图片代理
+    if (stage === 0) {
+        const externalProxyUrl = getDoubanExternalImageProxyUrl(originalUrl);
+        if (externalProxyUrl) {
+            img.setAttribute('data-douban-cover-stage', '1');
+            img.onerror = function() { handleDoubanCoverError(this); };
+            img.onload = function() {
+                this.classList.remove('object-contain');
+                this.classList.add('object-cover');
+            };
+            img.src = externalProxyUrl;
+            return;
+        }
+    }
+
+    // 第二层备援：LibreTV 自己的 authenticated proxy
+    if (stage <= 1) {
+        try {
+            const authProxyUrl = await getAuthenticatedDoubanProxyUrl(originalUrl);
+            if (authProxyUrl) {
+                img.setAttribute('data-douban-cover-stage', '2');
+                img.onerror = function() { handleDoubanCoverError(this); };
+                img.onload = function() {
+                    this.classList.remove('object-contain');
+                    this.classList.add('object-cover');
+                };
+                img.src = authProxyUrl;
+                return;
+            }
+        } catch (e) {
+            console.error('豆瓣封面 authenticated proxy 产生失败：', e);
+        }
+    }
+
+    showPlaceholder();
 }
 
-// 批量套用豆瓣封面 proxy。
-// 因为 proxy 鉴权是异步的，所以图片先放占位图，再由这里改成 authenticated proxy 图片网址。
-function applyDoubanProxyCovers(root = document) {
-    const images = root.querySelectorAll('img[data-douban-cover]');
-    images.forEach(img => {
-        const encodedUrl = img.getAttribute('data-douban-cover') || '';
-        setDoubanProxyCover(img, encodedUrl);
-    });
-}
-
-// 让 inline 事件和其他脚本可以稳定调用
+// 让 inline onerror 可以稳定调用
+window.handleDoubanCoverError = handleDoubanCoverError;
 window.getDoubanCoverPlaceholder = getDoubanCoverPlaceholder;
-window.setDoubanProxyCover = setDoubanProxyCover;
-window.applyDoubanProxyCovers = applyDoubanProxyCovers;
 
 // 抽取渲染豆瓣卡片的逻辑到单独函数
 function renderDoubanCards(data, container) {
@@ -616,42 +646,40 @@ function renderDoubanCards(data, container) {
             card.className = "bg-[#111] hover:bg-[#222] transition-all duration-300 rounded-lg overflow-hidden flex flex-col transform hover:scale-105 shadow-md hover:shadow-lg";
             
             // 生成卡片内容，确保安全显示（防止XSS）
-            const safeTitle = item.title
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;');
+            const titleText = item.title || '';
+            const safeTitle = escapeDoubanAttr(titleText);
+            const safeTitleForJs = escapeDoubanJsString(titleText);
             
-            const safeRate = (item.rate || "暂无")
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
+            const safeRate = escapeDoubanAttr(item.rate || "暂无");
+            const safeDoubanUrl = escapeDoubanAttr(item.url || '#');
             
-            // 处理图片URL
-            // 不再先直连豆瓣图片，避免浏览器直接请求 img*.doubanio.com 出现 418。
-            // 先放占位图，卡片渲染完后再由 applyDoubanProxyCovers() 改成带鉴权参数的 /proxy/ 图片。
+            // 处理图片URL：先直连豆瓣图片。
+            // 若出现 418/403/404，再由 handleDoubanCoverError 依序尝试第三方图片代理、LibreTV authenticated proxy、占位图。
             const originalCoverUrl = item.cover || '';
             const encodedCoverUrl = encodeURIComponent(originalCoverUrl);
-            const placeholderCoverUrl = getDoubanCoverPlaceholder(safeTitle);
+            const safeOriginalCoverUrl = escapeDoubanAttr(originalCoverUrl);
 
             // 为不同设备优化卡片布局
             card.innerHTML = `
-                <div class="relative w-full aspect-[2/3] overflow-hidden cursor-pointer" onclick="fillAndSearchWithDouban('${safeTitle}')">
-                    <img src="${placeholderCoverUrl}" alt="${safeTitle}" 
+                <div class="relative w-full aspect-[2/3] overflow-hidden cursor-pointer" onclick="fillAndSearchWithDouban('${safeTitleForJs}')">
+                    <img src="${safeOriginalCoverUrl}" alt="${safeTitle}" 
                         data-douban-cover="${encodedCoverUrl}"
-                        class="w-full h-full object-contain transition-transform duration-500 hover:scale-110"
-                        onerror="this.onerror=null; this.src=getDoubanCoverPlaceholder(this.alt); this.classList.remove('object-cover'); this.classList.add('object-contain');"
+                        data-douban-cover-stage="0"
+                        class="w-full h-full object-cover transition-transform duration-500 hover:scale-110"
+                        onerror="handleDoubanCoverError(this)"
                         loading="lazy" referrerpolicy="no-referrer">
                     <div class="absolute inset-0 bg-gradient-to-t from-black to-transparent opacity-60"></div>
                     <div class="absolute bottom-2 left-2 bg-black/70 text-white text-xs px-2 py-1 rounded-sm">
                         <span class="text-yellow-400">★</span> ${safeRate}
                     </div>
                     <div class="absolute bottom-2 right-2 bg-black/70 text-white text-xs px-2 py-1 rounded-sm hover:bg-[#333] transition-colors">
-                        <a href="${item.url}" target="_blank" rel="noopener noreferrer" title="在豆瓣查看" onclick="event.stopPropagation();">
+                        <a href="${safeDoubanUrl}" target="_blank" rel="noopener noreferrer" title="在豆瓣查看" onclick="event.stopPropagation();">
                             🔗
                         </a>
                     </div>
                 </div>
                 <div class="p-2 text-center bg-[#111]">
-                    <button onclick="fillAndSearchWithDouban('${safeTitle}')" 
+                    <button onclick="fillAndSearchWithDouban('${safeTitleForJs}')" 
                             class="text-sm font-medium text-white truncate w-full hover:text-pink-400 transition"
                             title="${safeTitle}">
                         ${safeTitle}
@@ -666,11 +694,6 @@ function renderDoubanCards(data, container) {
     // 清空并添加所有新元素
     container.innerHTML = "";
     container.appendChild(fragment);
-
-    // 预设直接改走 authenticated proxy，避免先直连豆瓣图片。
-    if (typeof window.applyDoubanProxyCovers === 'function') {
-        window.applyDoubanProxyCovers(container);
-    }
 }
 
 // 重置到首页
