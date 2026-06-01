@@ -518,6 +518,120 @@ function getDoubanCoverPlaceholder(title = '暂无封面') {
     return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
 }
 
+
+// TMDB 海报补图设置：
+// 1. 到 https://www.themoviedb.org/ 申请 API Key（v3 auth）。
+// 2. 把下方 PASTE_YOUR_TMDB_API_KEY_HERE 换成你的 v3 API Key。
+// 3. 不想写死在代码里，也可以在浏览器 Console 执行：localStorage.setItem('tmdbApiKey', '你的v3 API Key')
+const TMDB_API_KEY = '91a5e8650a6f20e54a2894a4eeba7bf7';
+const TMDB_POSTER_SIZE = 'w500';
+const TMDB_CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 天缓存，减少 API 请求
+
+function getTmdbApiKey() {
+    try {
+        const keyFromLocalStorage = (localStorage.getItem('tmdbApiKey') || '').trim();
+        if (keyFromLocalStorage) return keyFromLocalStorage;
+    } catch (e) {
+        console.warn('读取 TMDB API Key 失败：', e);
+    }
+
+    const keyFromCode = String(TMDB_API_KEY || '').trim();
+    if (!keyFromCode || keyFromCode === 'PASTE_YOUR_TMDB_API_KEY_HERE') return '';
+    return keyFromCode;
+}
+
+function getTmdbCacheKey(title, mediaType) {
+    return `tmdbPoster:${mediaType || 'multi'}:${title || ''}`;
+}
+
+function readTmdbPosterCache(title, mediaType) {
+    try {
+        const cached = JSON.parse(localStorage.getItem(getTmdbCacheKey(title, mediaType)) || 'null');
+        if (cached && Date.now() - cached.time < TMDB_CACHE_TTL) {
+            return cached.posterUrl || '';
+        }
+    } catch (e) {
+        console.warn('读取 TMDB 海报缓存失败：', e);
+    }
+    return null;
+}
+
+function writeTmdbPosterCache(title, mediaType, posterUrl) {
+    try {
+        localStorage.setItem(getTmdbCacheKey(title, mediaType), JSON.stringify({
+            time: Date.now(),
+            posterUrl: posterUrl || ''
+        }));
+    } catch (e) {
+        console.warn('写入 TMDB 海报缓存失败：', e);
+    }
+}
+
+function chooseBestTmdbPosterResult(results) {
+    if (!Array.isArray(results)) return null;
+    return results.find(item => item && item.poster_path) || null;
+}
+
+async function searchTmdbPosterByType(title, mediaType, language) {
+    const apiKey = getTmdbApiKey();
+    if (!apiKey || !title) return '';
+
+    const endpoint = mediaType === 'tv' ? 'tv' : 'movie';
+    const params = new URLSearchParams({
+        api_key: apiKey,
+        query: title,
+        language: language || 'zh-TW',
+        include_adult: 'false',
+        page: '1'
+    });
+
+    if (endpoint === 'movie') {
+        params.set('region', 'TW');
+    }
+
+    const url = `https://api.themoviedb.org/3/search/${endpoint}?${params.toString()}`;
+    const response = await fetch(url, {
+        headers: { 'Accept': 'application/json' }
+    });
+
+    if (!response.ok) {
+        throw new Error(`TMDB ${endpoint} 搜索失败：${response.status}`);
+    }
+
+    const data = await response.json();
+    const best = chooseBestTmdbPosterResult(data.results);
+    return best && best.poster_path ? `https://image.tmdb.org/t/p/${TMDB_POSTER_SIZE}${best.poster_path}` : '';
+}
+
+async function fetchTmdbPosterUrl(title, preferredType) {
+    const apiKey = getTmdbApiKey();
+    if (!apiKey || !title) return '';
+
+    const normalizedTitle = String(title || '').trim();
+    const mediaType = preferredType === 'tv' ? 'tv' : 'movie';
+    const cached = readTmdbPosterCache(normalizedTitle, mediaType);
+    if (cached !== null) return cached;
+
+    const searchOrder = mediaType === 'tv'
+        ? [['tv', 'zh-TW'], ['tv', 'zh-CN'], ['movie', 'zh-TW'], ['movie', 'zh-CN'], ['tv', 'en-US']]
+        : [['movie', 'zh-TW'], ['movie', 'zh-CN'], ['tv', 'zh-TW'], ['tv', 'zh-CN'], ['movie', 'en-US']];
+
+    for (const [type, language] of searchOrder) {
+        try {
+            const posterUrl = await searchTmdbPosterByType(normalizedTitle, type, language);
+            if (posterUrl) {
+                writeTmdbPosterCache(normalizedTitle, mediaType, posterUrl);
+                return posterUrl;
+            }
+        } catch (e) {
+            console.warn(`TMDB ${type}/${language} 搜索失败：`, e);
+        }
+    }
+
+    writeTmdbPosterCache(normalizedTitle, mediaType, '');
+    return '';
+}
+
 // HTML 属性安全处理
 function escapeDoubanAttr(value = '') {
     return String(value)
@@ -565,53 +679,62 @@ async function getAuthenticatedDoubanProxyUrl(originalUrl) {
 
 // 豆瓣封面错误处理顺序：
 // 1. 原始豆瓣图片失败后，先试第三方图片代理。
-// 2. 第三方图片代理失败后，再试带 auth/t 的 LibreTV /proxy/。
-// 3. 仍失败才显示「暂无封面」。
+// 2. 第三方图片代理失败后，改用 TMDB 搜片名补海报。
+// 3. TMDB 没有命中时，再试带 auth/t 的 LibreTV /proxy/。
+// 4. 仍失败才显示「暂无封面」。
 async function handleDoubanCoverError(img) {
     const encodedUrl = img.getAttribute('data-douban-cover') || '';
     const stage = Number(img.getAttribute('data-douban-cover-stage') || '0');
     const originalUrl = decodeURIComponent(encodedUrl || '');
+    const title = img.getAttribute('data-douban-title') || img.alt || '';
+    const mediaType = img.getAttribute('data-douban-type') || (typeof doubanMovieTvCurrentSwitch !== 'undefined' ? doubanMovieTvCurrentSwitch : 'movie');
+
+    const setCover = (url, nextStage) => {
+        img.setAttribute('data-douban-cover-stage', String(nextStage));
+        img.onerror = function() { handleDoubanCoverError(this); };
+        img.onload = function() {
+            this.classList.remove('object-contain');
+            this.classList.add('object-cover');
+        };
+        img.src = url;
+    };
 
     const showPlaceholder = () => {
         img.onerror = null;
         img.onload = null;
-        img.src = getDoubanCoverPlaceholder(img.alt);
+        img.src = getDoubanCoverPlaceholder(title || img.alt);
         img.classList.remove('object-cover');
         img.classList.add('object-contain');
     };
 
-    if (!originalUrl || originalUrl === 'undefined' || originalUrl === 'null') {
-        showPlaceholder();
-        return;
-    }
-
     // 第一层备援：第三方图片代理
-    if (stage === 0) {
+    if (stage === 0 && originalUrl && originalUrl !== 'undefined' && originalUrl !== 'null') {
         const externalProxyUrl = getDoubanExternalImageProxyUrl(originalUrl);
         if (externalProxyUrl) {
-            img.setAttribute('data-douban-cover-stage', '1');
-            img.onerror = function() { handleDoubanCoverError(this); };
-            img.onload = function() {
-                this.classList.remove('object-contain');
-                this.classList.add('object-cover');
-            };
-            img.src = externalProxyUrl;
+            setCover(externalProxyUrl, 1);
             return;
         }
     }
 
-    // 第二层备援：LibreTV 自己的 authenticated proxy
+    // 第二层备援：TMDB 按片名补海报。需要填入 TMDB_API_KEY 才会启用。
     if (stage <= 1) {
+        try {
+            const tmdbPosterUrl = await fetchTmdbPosterUrl(title, mediaType);
+            if (tmdbPosterUrl) {
+                setCover(tmdbPosterUrl, 2);
+                return;
+            }
+        } catch (e) {
+            console.warn('TMDB 海报补图失败：', e);
+        }
+    }
+
+    // 第三层备援：LibreTV 自己的 authenticated proxy
+    if (stage <= 2 && originalUrl && originalUrl !== 'undefined' && originalUrl !== 'null') {
         try {
             const authProxyUrl = await getAuthenticatedDoubanProxyUrl(originalUrl);
             if (authProxyUrl) {
-                img.setAttribute('data-douban-cover-stage', '2');
-                img.onerror = function() { handleDoubanCoverError(this); };
-                img.onload = function() {
-                    this.classList.remove('object-contain');
-                    this.classList.add('object-cover');
-                };
-                img.src = authProxyUrl;
+                setCover(authProxyUrl, 3);
                 return;
             }
         } catch (e) {
@@ -665,6 +788,8 @@ function renderDoubanCards(data, container) {
                     <img src="${safeOriginalCoverUrl}" alt="${safeTitle}" 
                         data-douban-cover="${encodedCoverUrl}"
                         data-douban-cover-stage="0"
+                        data-douban-title="${safeTitle}"
+                        data-douban-type="${doubanMovieTvCurrentSwitch}"
                         class="w-full h-full object-cover transition-transform duration-500 hover:scale-110"
                         onerror="handleDoubanCoverError(this)"
                         loading="lazy" referrerpolicy="no-referrer">
