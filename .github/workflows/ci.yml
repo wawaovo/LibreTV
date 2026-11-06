@@ -48,3 +48,6 @@ jobs:
 
       - name: Unit tests
         run: npm test
+
+      - name: Build Next.js (deployment validation)
+        run: npm run build
