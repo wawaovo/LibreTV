@@ -603,8 +603,13 @@ function getCustomApiInfo(customApiIndex) {
     return customAPIs[index];
 }
 
-// 搜索功能 - 修改为支持多选API和多页结果
+// 同时搜索时，只允许最后一次搜索更新页面，避免旧请求覆盖新结果。
+let latestLegacySearchId = 0;
+
+// 搜索功能 - 支持多选API、多页结果与相关性过滤
 async function search() {
+    const searchId = ++latestLegacySearchId;
+    window.__legacySearchAuthIssue = false;
     // 强化的密码保护校验 - 防止绕过
     try {
         if (window.ensurePasswordProtection) {
@@ -649,16 +654,42 @@ async function search() {
         // 等待所有搜索请求完成
         const resultsArray = await Promise.all(searchPromises);
 
-        // 合并所有结果
+        if (searchId !== latestLegacySearchId) return;
+
+        // 合并结果。searchByAPIAndKeyWord 已过滤资源 API 忽略关键词时回传的目录。
         resultsArray.forEach(results => {
             if (Array.isArray(results) && results.length > 0) {
                 allResults = allResults.concat(results);
             }
         });
 
-        // 对搜索结果进行排序：按名称优先，名称相同时按接口源排序
+        // 保守二次校验；如果单一来源错误返回整站目录，也不显示无关片名。
+        allResults = allResults.filter(item => isRelevantSearchResult(item, query));
+
+        // 黄色内容过滤在更新结果数量之前完成，避免「数量」与卡片不一致。
+        const yellowFilterEnabled = localStorage.getItem('yellowFilterEnabled') === 'true';
+        if (yellowFilterEnabled) {
+            const banned = ['伦理片', '福利', '里番动漫', '门事件', '萝莉少女', '制服诱惑', '国产传媒', 'cosplay', '黑丝诱惑', '无码', '日本无码', '有码', '日本有码', 'SWAG', '网红主播', '色情片', '同性片', '福利视频', '福利片'];
+            allResults = allResults.filter(item => {
+                const typeName = item.type_name || '';
+                return !banned.some(keyword => typeName.includes(keyword));
+            });
+        }
+
+        // 不同来源的同片保留不同来源，单一来源/ID 重复只展示一次。
+        const seen = new Set();
+        allResults = allResults.filter(item => {
+            const id = item.vod_id == null ? '' : String(item.vod_id);
+            const key = id ? String(item.source_code || '') + ':' + id : '';
+            if (key && seen.has(key)) return false;
+            if (key) seen.add(key);
+            return true;
+        });
+
+        // 对搜索结果进行排序：精确命中与片名前缀优先，再依名称及来源排序
         allResults.sort((a, b) => {
-            // 首先按照视频名称排序
+            const relevance = searchMatchPriority(a, query) - searchMatchPriority(b, query);
+            if (relevance !== 0) return relevance;
             const nameCompare = (a.vod_name || '').localeCompare(b.vod_name || '');
             if (nameCompare !== 0) return nameCompare;
             
@@ -694,7 +725,7 @@ async function search() {
                               d="M9.172 16.172a4 4 0 015.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                     </svg>
                     <h3 class="mt-2 text-lg font-medium text-gray-400">没有找到匹配的结果</h3>
-                    <p class="mt-1 text-sm text-gray-500">请尝试其他关键词或更换数据源</p>
+                    <p class="mt-1 text-sm text-gray-500">${window.__legacySearchAuthIssue ? '数据源连接返回 401，请重新确认站点登录状态和 Cloudflare PASSWORD 配置' : '请尝试其他关键词或更换数据源（已过滤无关影片）'}</p>
                 </div>
             `;
             hideLoading();
@@ -716,16 +747,6 @@ async function search() {
         } catch (e) {
             console.error('更新浏览器历史失败:', e);
             // 如果更新URL失败，继续执行搜索
-        }
-
-        // 处理搜索结果过滤：如果启用了黄色内容过滤，则过滤掉分类含有敏感内容的项目
-        const yellowFilterEnabled = localStorage.getItem('yellowFilterEnabled') === 'true';
-        if (yellowFilterEnabled) {
-            const banned = ['伦理片', '福利', '里番动漫', '门事件', '萝莉少女', '制服诱惑', '国产传媒', 'cosplay', '黑丝诱惑', '无码', '日本无码', '有码', '日本有码', 'SWAG', '网红主播', '色情片', '同性片', '福利视频', '福利片'];
-            allResults = allResults.filter(item => {
-                const typeName = item.type_name || '';
-                return !banned.some(keyword => typeName.includes(keyword));
-            });
         }
 
         // 添加XSS保护，使用textContent和属性转义
@@ -806,7 +827,7 @@ async function search() {
             showToast('搜索请求失败，请稍后重试', 'error');
         }
     } finally {
-        hideLoading();
+        if (searchId === latestLegacySearchId) hideLoading();
     }
 }
 
