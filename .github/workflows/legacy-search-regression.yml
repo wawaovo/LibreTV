@@ -1,0 +1,27 @@
+name: legacy-search-regression
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'js/search.js'
+      - 'js/app.js'
+      - 'tests/legacy-search.test.cjs'
+      - '.github/workflows/legacy-search-regression.yml'
+  push:
+    branches: [fix-legacy-search-relevance]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --check js/search.js
+      - run: node --check js/app.js
+      - run: node --test tests/legacy-search.test.cjs
